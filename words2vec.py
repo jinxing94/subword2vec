@@ -12,6 +12,8 @@ import tensorflow as tf
 from data_utils import read_params
 import pdb
 import cPickle
+import threading
+import time
 data_index = 0
 #read the whole dataset and related dictionary and mapping parameters
 data = read_params('dictionary/data')
@@ -63,6 +65,7 @@ def generate_cbow_batch(num_skips, skip_window):
 	global data_index
 	global word2char
 	global char2comp
+	global data_size
 	assert num_skips <= 2 * skip_window
 	word_input = np.ndarray(shape=(num_skips), dtype=np.int32)
 	word_label = [[data[skip_window + data_index]]]
@@ -83,17 +86,36 @@ def generate_cbow_batch(num_skips, skip_window):
 	if (data_index >= data_size - span):
 		data_index = 0
 	return word_input,char_input,comp_input,word_label
+def generate_cbow_batch_thread(num_skips, skip_window,sample_index):
+	global word2char
+	global char2comp
+	assert num_skips <= 2 * skip_window
+	word_input = np.ndarray(shape=(num_skips), dtype=np.int32)
+	word_label = [[data[skip_window + sample_index]]]
+	char_input = []
+	comp_input = []
+	span = 2 * skip_window + 1  # [ skip_window target skip_window ]
+	target = skip_window
+	targets_to_avoid = [skip_window]
+	for i in range(num_skips):
+		while target in targets_to_avoid:
+			target = random.randint(0, span - 1)
+		targets_to_avoid.append(target)
+		word_input[i] = data[sample_index + target]
+		char_input += word2char[word_input[i]]
+	for ch in char_input:
+		comp_input += char2comp[ch]
+	return word_input, char_input,comp_input,word_label
 def save_word_embeddings(fname,embeddings):
 	f = open(fname,'w')
 	cPickle.dump(embeddings, f)
 	f.close()
-
 #Hyper parameter settings
 batch_size = 1      # batch size of SGD
 embedding_size = 100  # Dimension of the embedding vector.
-skip_window = 1       # How many words to consider left and right.
-num_skips = 2         # How many times to reuse an input to generate a label.
-num_sampled = 5
+skip_window = 5       # How many words to consider left and right.
+num_skips = 10         # How many times to reuse an input to generate a label.
+num_sampled = 10
 #test generate_cbow_batch function
 print (data[0:10])
 for i in range(10):
@@ -119,8 +141,8 @@ with graph.as_default():
 		embed = tf.nn.embedding_lookup(embeddings, train_inputs)
 		# Construct the variables for the NCE loss
 		word_nce_weights = tf.Variable(
-        	tf.truncated_normal([word_size, embedding_size],
-        		stddev=1.0 / math.sqrt(embedding_size)))
+			tf.truncated_normal([word_size, embedding_size],
+				stddev=1.0 / math.sqrt(embedding_size)))
 		word_nce_biases = tf.Variable(tf.zeros([word_size]))
 		char_nce_weights = tf.Variable(
 			tf.truncated_normal([char_size, embedding_size],
@@ -132,8 +154,8 @@ with graph.as_default():
 		comp_nce_biases = tf.Variable(tf.zeros([comp_size]))
 		#compute the loss of predicting the target word and its characters and components
 		word_loss = tf.reduce_mean(
-      	tf.nn.nce_loss(word_nce_weights, word_nce_biases, embed, tword_labels,
-                     num_sampled, word_size))
+		tf.nn.nce_loss(word_nce_weights, word_nce_biases, embed, tword_labels,
+					 num_sampled, word_size))
 		char_loss = tf.reduce_mean()
 		comp_loss = 
 		loss = word_loss + char_loss + comp_loss
@@ -168,8 +190,8 @@ with graph2.as_default():
 		comp_context = tf.reduce_mean(comp_embed,0)
 		comp_context = tf.reshape(comp_context,[1, embedding_size])
 		nce_weights = tf.Variable(
-        	tf.truncated_normal([word_size, embedding_size],
-        		stddev=1.0 / math.sqrt(embedding_size)))
+			tf.truncated_normal([word_size, embedding_size],
+				stddev=1.0 / math.sqrt(embedding_size)))
 		nce_biases = tf.Variable(tf.zeros([word_size]))
 		loss1 = tf.reduce_mean(
 			tf.nn.nce_loss(nce_weights, nce_biases, word_context, tword_label,num_sampled, word_size))
@@ -178,17 +200,58 @@ with graph2.as_default():
 		loss3 = tf.reduce_mean(
 			tf.nn.nce_loss(nce_weights, nce_biases, comp_context, tword_label,num_sampled, word_size))
 		loss = loss1 + loss2 + loss3
-		optimizer = tf.train.GradientDescentOptimizer(0.1).minimize(loss)
+		global_step = tf.Variable(0, name="global_step",trainable=False)
+		optimizer = tf.train.GradientDescentOptimizer(0.025).minimize(loss,global_step=global_step)
 		init = tf.initialize_all_variables()
 		#normalize the final word embeddings
 		norm = tf.sqrt(tf.reduce_sum(tf.square(word_embeddings), 1, keep_dims=True))
 		normalized_embeddings = word_embeddings / norm
 		saver = tf.train.Saver()
 #Train the cbow model
-num_steps = data_size * 5
-print_steps = 1000
-save_steps = 1000000
+epoch_num = 3  #use the whole training dataset three times
+num_steps = data_size * epoch_num
+print_steps = 10000
+save_steps = 5000000
 retrain = False
+'''
+thread_num = 4
+session = tf.Session(graph=graph2)
+def train_thread(pid, start_index, end_index):
+	global session
+	for sample_index in xrange(start_index, end_index):
+		word_input,char_input,comp_input,word_label = generate_cbow_batch_thread(num_skips, skip_window, sample_index)
+		feed_dict = {tword_input: word_input, tchar_input: char_input, 
+			tcomp_input: comp_input, tword_label: word_label}
+		_, step = session.run([optimizer, global_step], feed_dict=feed_dict)
+		#use the thread info to print the log and save the model at proper time
+		if step > 0 and step % print_steps == 0:
+			loss1_val, loss2_val, loss3_val,loss_val = session.run([loss1, loss2, loss3, loss])
+			print('Thread ',pid, ' loss ',loss_val,' loss1 ',loss1_val,' loss2 ',loss2_val,' loss3 ',loss3_val)
+		if step > 0 and step % save_steps == 0:
+			saver.save(session, 'model_param/model', global_step=step)
+init.run()
+print("Initialized")
+print('Num steps: ',num_steps)
+if retrain == True:
+	saver.restore(session, 'model_param/model-74000000')
+	print('Successfully load the parameters from model-74000000')
+span = 2 * skip_window + 1  # [ skip_window target skip_window ]
+max_index = data_size - span
+thread_index = [max_index / thread_num * i for i in xrange(thread_num + 1)]
+for epoch in range(epoch_num):
+	print('Training epoch ',epoch)
+	workers = []
+	for i in range(thread_num):
+		t = threading.Thread(target=train_thread,args=(i,thread_index[i],thread_index[i+1]))
+		workers.append(t)
+	for t in workers:
+		t.join()
+#compute and save the final word embeddings
+word_embeddings = normalized_embeddings.eval()
+save_fname = 'result/word_embeddings.pk2'
+save_word_embeddings(save_fname, word_embeddings)
+session.close()
+'''
 with tf.Session(graph=graph2) as session:
 	init.run()
 	print("Initialized")
@@ -198,6 +261,7 @@ with tf.Session(graph=graph2) as session:
 		print('Successfully load the parameters from model-74000000')
 	average_loss = 0
 	for step in xrange(num_steps):
+		#run multiple threads
 		word_input,char_input,comp_input,word_label = generate_cbow_batch(num_skips, skip_window)
 		feed_dict = {tword_input: word_input, tchar_input: char_input, 
 			tcomp_input: comp_input, tword_label: word_label}
@@ -206,7 +270,8 @@ with tf.Session(graph=graph2) as session:
 		if step % print_steps == 0:
 			if step > 0:
 				average_loss /= print_steps
-			print("Average loss at step ", step, ": ", average_loss)
+			localtime = time.asctime(time.localtime(time.time()))
+			print("time : ",localtime," Average loss at step ", step, ": ", average_loss)
 			if math.isnan(average_loss):
 				print('Input ',step, ' ', word_input,char_input,comp_input,word_label)
 				print('char_embed ',char_embed_val, 'char_context ', char_context_eval, 'loss2 ', loss2_val, 'loss1 ', loss1_val)
@@ -218,5 +283,5 @@ with tf.Session(graph=graph2) as session:
 				saver.save(session, 'model_param/model', global_step=step)
 	#compute and save the final word embeddings
 	word_embeddings = normalized_embeddings.eval()
-	save_fname = 'result/word_embeddings.pk'
+	save_fname = 'result/word_embeddings3.pk'
 	save_word_embeddings(save_fname, word_embeddings)
